@@ -1,11 +1,38 @@
 import tinytuya
 import time
 import base64
+import signal
+import sys
+import logging
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configuration
-DEVICE_ID = 'device_id'
-IP_ADDRESS = 'device_local_ip'
-LOCAL_KEY = 'device_local_key'
+DEVICE_ID = os.environ['DEVICE_ID']
+IP_ADDRESS = os.environ['IP_ADDRESS']
+LOCAL_KEY = os.environ['LOCAL_KEY']
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.FileHandler('monitor.log'), logging.StreamHandler(sys.stderr)]
+)
+logger = logging.getLogger(__name__)
+
+# Graceful shutdown
+running = True
+
+def shutdown(signum, frame):
+    global running
+    logger.info("Shutting down...")
+    running = False
+
+signal.signal(signal.SIGINT, shutdown)
+signal.signal(signal.SIGTERM, shutdown)
 
 d = tinytuya.OutletDevice(DEVICE_ID, IP_ADDRESS, LOCAL_KEY)
 d.set_version(3.5)
@@ -21,18 +48,26 @@ memory = {
     'reported_current': 0.0
 }
 
+REQUIRED_PAYLOAD_BYTES = 8
+
 def decode_dlq(b64_str):
-    if not b64_str or len(b64_str) < 10: return None
+    if not b64_str or len(b64_str) < 10:
+        return None
     try:
         raw = base64.b64decode(b64_str)
+        if len(raw) < REQUIRED_PAYLOAD_BYTES:
+            logger.warning("Short payload: expected %d bytes, got %d", REQUIRED_PAYLOAD_BYTES, len(raw))
+            return None
         return {
             'v': int.from_bytes(raw[0:2], 'big') / 10.0,
             'i': int.from_bytes(raw[2:5], 'big') / 1000.0,
             'p': int.from_bytes(raw[5:8], 'big')
         }
-    except: return None
+    except (ValueError, base64.binascii.Error) as e:
+        logger.warning("Failed to decode DLQ payload: %s", e)
+        return None
 
-while True:
+while running:
     try:
         payload = d.generate_payload(tinytuya.UPDATEDPS, ['6', '7', '8', '111', '118'])
         d.send(payload)
@@ -46,7 +81,7 @@ while True:
                     memory['phases'][dp_id] = new_data
             
             if '111' in dps: memory['total_power'] = dps['111']
-            if '118' in dps: memory['reported_current'] = dps['118'] / 10.0 # Adjusted scaling
+            if '118' in dps: memory['reported_current'] = dps['118'] / 10.0  # Adjusted scaling
 
             # UI Refresh
             print("\033[H\033[J", end="") 
@@ -61,5 +96,10 @@ while True:
             print(f"SUM OF CURRENTS:      {calc_total_i:7.3f} A")
             print(f"RAW ID 118 SENSOR:    {memory['reported_current']:7.2f}")
             
-    except Exception: pass
+    except ConnectionError as e:
+        logger.error("Connection lost: %s. Retrying...", e)
+    except Exception as e:
+        logger.error("Unexpected error: %s", e)
     time.sleep(1)
+
+logger.info("Monitor stopped.")
